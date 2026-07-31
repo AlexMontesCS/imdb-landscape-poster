@@ -3,6 +3,7 @@ const GRAPHQL_ENDPOINTS = [
   "https://caching.graphql.imdb.com/",
 ];
 
+const VERSION = "1.4.0";
 const CACHE_SECONDS = 6 * 60 * 60;
 const BROWSER_CACHE_SECONDS = 60 * 60;
 
@@ -32,6 +33,7 @@ export default {
     if (url.pathname === "/") {
       return jsonResponse({
         service: "IMDb #1 portrait posters",
+        version: VERSION,
         endpoints: {
           moviePoster: "/movie",
           tvPoster: "/tv",
@@ -40,7 +42,7 @@ export default {
           moviePosterUrl: "/movie?url=1",
           tvPosterUrl: "/tv?url=1",
         },
-        note: "The /movie and /tv routes return IMDb's vertical primary poster directly.",
+        note: "Only IMDb images explicitly categorized as Poster are returned. Landscape still frames are rejected.",
       });
     }
 
@@ -73,6 +75,7 @@ export default {
           poster: item.poster.url,
           posterWidth: item.poster.width,
           posterHeight: item.poster.height,
+          posterType: item.poster.groupType,
           imdbUrl: `https://www.imdb.com/title/${item.id}/`,
         });
       } else if (url.searchParams.get("url") === "1") {
@@ -116,6 +119,14 @@ async function getNumberOnePoster(chart) {
             id
             titleText { text }
             primaryImage { url width height type }
+            imageTypes {
+              imageType { imageTypeId text }
+              images(first: 50) {
+                edges {
+                  node { url width height type }
+                }
+              }
+            }
           }
         }
       }
@@ -125,15 +136,45 @@ async function getNumberOnePoster(chart) {
   const data = await fetchIMDbGraphQL(query);
   const edge = data?.chartTitles?.edges?.[0];
   const title = edge?.node;
-  const poster = title?.primaryImage;
 
   if (!title?.id) {
     throw new Error("IMDb returned no #1 chart title.");
   }
 
-  if (!isUsablePoster(poster)) {
+  const posterCandidates = [];
+
+  for (const group of title.imageTypes ?? []) {
+    const typeId = String(group?.imageType?.imageTypeId ?? "");
+    const typeText = String(group?.imageType?.text ?? "");
+    const groupType = `${typeId} ${typeText}`.trim();
+
+    if (!isPosterType(groupType)) continue;
+
+    for (const imageEdge of group?.images?.edges ?? []) {
+      const image = imageEdge?.node;
+      if (isPortraitPoster(image)) {
+        posterCandidates.push({
+          ...image,
+          groupType: groupType || "poster",
+        });
+      }
+    }
+  }
+
+  // IMDb says primary posters should be vertical, but primaryImage can occasionally
+  // be a still. Use it only when it is unmistakably portrait-oriented.
+  if (isPortraitPoster(title.primaryImage)) {
+    posterCandidates.push({
+      ...title.primaryImage,
+      groupType: "primary portrait poster",
+    });
+  }
+
+  const poster = posterCandidates.sort((a, b) => posterScore(b) - posterScore(a))[0];
+
+  if (!poster) {
     throw new Error(
-      `IMDb returned no usable primary poster for ${title.titleText?.text ?? title.id}.`,
+      `IMDb returned no portrait image categorized as Poster for ${title.titleText?.text ?? title.id}. Refusing to return a still frame.`,
     );
   }
 
@@ -161,7 +202,7 @@ async function fetchIMDbGraphQL(query) {
           Accept: "application/json",
           Origin: "https://www.imdb.com",
           Referer: "https://www.imdb.com/",
-          "User-Agent": "Mozilla/5.0 IMDbPortraitPosterWorker/1.3",
+          "User-Agent": `Mozilla/5.0 IMDbPortraitPosterWorker/${VERSION}`,
           "x-imdb-client-name": "imdb-web-next-localized",
           "x-imdb-user-language": "en-US",
           "x-imdb-user-country": "US",
@@ -195,7 +236,7 @@ async function proxyPoster(item) {
     headers: {
       Accept: "image/avif,image/webp,image/*,*/*;q=0.8",
       Referer: `https://www.imdb.com/title/${item.id}/`,
-      "User-Agent": "Mozilla/5.0 IMDbPortraitPosterWorker/1.3",
+      "User-Agent": `Mozilla/5.0 IMDbPortraitPosterWorker/${VERSION}`,
     },
     cf: {
       cacheEverything: true,
@@ -226,6 +267,7 @@ async function proxyPoster(item) {
   headers.set("X-IMDb-Rank", String(item.rank));
   headers.set("X-IMDb-Title", encodeURIComponent(item.title));
   headers.set("X-Poster-Orientation", "portrait");
+  headers.set("X-Poster-Source", item.poster.groupType);
   headers.set("X-Content-Type-Options", "nosniff");
 
   return new Response(response.body, {
@@ -234,7 +276,12 @@ async function proxyPoster(item) {
   });
 }
 
-function isUsablePoster(image) {
+function isPosterType(value) {
+  const normalized = String(value).toLowerCase().replace(/[_-]+/g, " ");
+  return /(^|\s)poster(s)?($|\s)/.test(normalized);
+}
+
+function isUsableImage(image) {
   return Boolean(
     image?.url &&
       Number.isFinite(image.width) &&
@@ -242,6 +289,22 @@ function isUsablePoster(image) {
       image.width > 0 &&
       image.height > 0,
   );
+}
+
+function isPortraitPoster(image) {
+  if (!isUsableImage(image)) return false;
+  const ratio = image.width / image.height;
+  // IMDb recommends poster artwork near 0.675 width/height. This broad range
+  // accepts normal one-sheet posters while rejecting frames and banners.
+  return ratio >= 0.45 && ratio <= 0.82 && image.height > image.width;
+}
+
+function posterScore(image) {
+  const ratio = image.width / image.height;
+  const ratioScore = 1 / (1 + Math.abs(ratio - 0.675) * 8);
+  const areaScore = Math.log10(Math.max(1, image.width * image.height));
+  const primaryBonus = String(image.groupType).includes("primary") ? 1 : 0;
+  return ratioScore * 10 + areaScore + primaryBonus;
 }
 
 function getLargestIMDbImageUrl(imageUrl) {
@@ -258,6 +321,9 @@ function getLargestIMDbImageUrl(imageUrl) {
 function createCacheKey(url) {
   const cacheUrl = new URL(url.toString());
   cacheUrl.searchParams.delete("refresh");
+  // Version the Cache API key so an older still-frame response cannot survive
+  // after deploying this fixed Worker.
+  cacheUrl.searchParams.set("__worker_version", VERSION);
   return new Request(cacheUrl.toString(), { method: "GET" });
 }
 
@@ -303,9 +369,11 @@ function imageExtension(contentType) {
 }
 
 function slugify(value) {
-  return value
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .slice(0, 80) || "imdb-number-one";
+  return (
+    value
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .slice(0, 80) || "imdb-number-one"
+  );
 }
