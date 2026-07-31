@@ -1,0 +1,23 @@
+IMDb LANDSCAPE WORKER — START HERE
+==================================
+
+EASIEST VISUAL METHOD
+1. Open START-HERE.html in your browser.
+2. Create a PUBLIC GitHub repository named: imdb-landscape-worker
+3. Upload every file from this folder to that repository.
+4. Paste the repository URL into START-HERE.html.
+5. Press the big "Deploy to Cloudflare" button.
+
+FAST COMMAND-LINE METHOD
+- macOS/Linux: ./publish-github.sh
+- Windows PowerShell: ./publish-github.ps1
+
+Those scripts require the GitHub CLI (gh) and Git.
+
+AFTER DEPLOYMENT
+https://YOUR-WORKER.workers.dev/movie
+https://YOUR-WORKER.workers.dev/tv
+
+Metadata:
+/movie?json=1
+/tv?json=1
